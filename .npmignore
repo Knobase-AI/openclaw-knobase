@@ -1,0 +1,18 @@
+# Don't publish these to NPM
+.git
+.github
+.vscode
+.idea
+*.log
+.DS_Store
+.env
+.env.local
+.eslintcache
+.nyc_output
+coverage/
+test/
+tests/
+docs/
+AGENT_ID_SPEC.md
+SKILL.md
+install.sh
