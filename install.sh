@@ -3,13 +3,13 @@
 # OpenClaw Knobase Installation Script
 # 
 # Install with:
-#   curl -fsSL https://raw.githubusercontent.com/ChrisLeeML/openclaw-knobase/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Knobase-AI/openclaw-knobase/main/install.sh | bash
 #
 
 set -e
 
 SKILL_DIR="$HOME/.openclaw/skills/knobase"
-REPO_URL="https://github.com/ChrisLeeML/openclaw-knobase.git"
+REPO_URL="https://github.com/Knobase-AI/openclaw-knobase.git"
 
 echo "🚀 Installing Knobase Skill for OpenClaw..."
 echo ""
