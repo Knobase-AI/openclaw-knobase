@@ -18,15 +18,32 @@ npm install
 
 ### 2. Authenticate
 
+There are two ways to authenticate with Knobase:
+
+#### Method 1: Device Code Flow (Recommended)
+
 ```bash
 openclaw knobase auth
 ```
 
-This will:
-- Generate a unique **Agent ID** for this OpenClaw instance
-- Authenticate with Knobase using your API key
-- Register the agent with your workspace
-- Store credentials securely
+This starts an interactive device code flow:
+1. The CLI displays a URL and a one-time code
+2. Open the URL in your browser (e.g. `https://knobase.com/device`)
+3. Enter the code shown in your terminal
+4. Approve the connection in your browser
+5. The CLI automatically completes authentication once approved
+
+The device code flow generates a unique **Agent ID**, registers the agent with your workspace, and stores credentials securely — no need to manually copy API keys.
+
+#### Method 2: API Key (Advanced)
+
+For CI/CD pipelines or headless environments where a browser is not available:
+
+```bash
+openclaw knobase auth --api-key kb_xxxx...
+```
+
+Pass your Knobase API key directly. This skips the interactive flow and authenticates immediately using the provided key.
 
 ### 3. Connect to Workspace
 
@@ -71,7 +88,8 @@ Receive important notifications from Knobase:
 
 | Command | Description |
 |---------|-------------|
-| `openclaw knobase auth` | Authenticate and register agent |
+| `openclaw knobase auth` | Authenticate via device code flow |
+| `openclaw knobase auth --api-key` | Authenticate with an API key (CI/CD) |
 | `openclaw knobase connect` | Connect to a workspace |
 | `openclaw knobase status` | Check connection status |
 | `openclaw knobase disconnect` | Disconnect from workspace |
@@ -158,7 +176,7 @@ The skill provides these tools to OpenClaw:
 ## Troubleshooting
 
 ### "Not authenticated"
-Run `openclaw knobase auth` first.
+Run `openclaw knobase auth` to start the device code flow, or `openclaw knobase auth --api-key kb_xxxx...` if using an API key.
 
 ### "Webhook not receiving"
 Check:

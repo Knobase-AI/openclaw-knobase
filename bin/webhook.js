@@ -3,6 +3,8 @@
 /**
  * Knobase Webhook Server
  * 
+ * Receives webhooks from Knobase and triggers OpenClaw agent processing
+ * 
  * Usage: openclaw knobase webhook start [--port 3456] [--daemon]
  */
 
@@ -10,8 +12,8 @@ import express from 'express';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import crypto from 'crypto';
 import chalk from 'chalk';
+import { mountWebhookHandler } from '../src/webhook-handler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_DIR = path.resolve(__dirname, '..');
@@ -19,6 +21,9 @@ const ENV_FILE = path.join(SKILL_DIR, '.env');
 
 let config = null;
 
+/**
+ * Load configuration from .env file
+ */
 async function loadConfig() {
   try {
     const content = await fs.readFile(ENV_FILE, 'utf8');
@@ -35,161 +40,197 @@ async function loadConfig() {
   }
 }
 
-function verifySignature(payload, signature, secret) {
-  if (!signature || !secret) return true;
-  
-  const expected = crypto
-    .createHmac('sha256', secret)
-    .update(JSON.stringify(payload), 'utf8')
-    .digest('hex');
-  
-  try {
-    return crypto.timingSafeEqual(
-      Buffer.from(signature),
-      Buffer.from(expected)
-    );
-  } catch {
-    return false;
-  }
+/**
+ * Error handling middleware
+ */
+function errorHandler(err, req, res, next) {
+  console.error(chalk.red('[Server] Unhandled error:'), err.message);
+  console.error(chalk.gray(err.stack));
+
+  res.status(500).json({
+    error: 'Internal server error',
+    message: err.message,
+    timestamp: new Date().toISOString()
+  });
 }
 
-async function sendTelegram(message) {
-  if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) {
-    console.log(chalk.yellow('Telegram not configured, skipping notification'));
-    return;
-  }
+/**
+ * Request logging middleware
+ */
+function requestLogger(req, res, next) {
+  const timestamp = new Date().toISOString();
+  const method = chalk.cyan(req.method);
+  const url = chalk.white(req.path);
   
-  try {
-    const response = await fetch(
-      `https://api.telegram.org/bot${config.TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: config.TELEGRAM_CHAT_ID,
-          text: message,
-          parse_mode: 'HTML',
-          disable_web_page_preview: false
-        })
+  console.log(chalk.gray(`[${timestamp}]`) + ` ${method} ${url}`);
+  
+  // Log response time on finish
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const status = res.statusCode < 400 ? chalk.green(res.statusCode) : chalk.red(res.statusCode);
+    console.log(chalk.gray(`[${timestamp}]`) + ` ${status} ${chalk.gray(`${duration}ms`)}`);
+  });
+  
+  next();
+}
+
+/**
+ * Webhook logging middleware
+ */
+function webhookLogger(req, res, next) {
+  if (req.path === '/webhook/knobase') {
+    console.log(chalk.magenta('\n' + '='.repeat(60)));
+    console.log(chalk.magenta.bold('  INCOMING WEBHOOK FROM KNOBASE'));
+    console.log(chalk.magenta('='.repeat(60)));
+    console.log(chalk.white('Timestamp:'), new Date().toISOString());
+    console.log(chalk.white('IP:'), req.ip || req.connection.remoteAddress);
+    console.log(chalk.white('Headers:'));
+    Object.entries(req.headers).forEach(([key, value]) => {
+      if (key.toLowerCase().includes('knobase') || key.toLowerCase() === 'content-type') {
+        console.log(chalk.gray(`  ${key}:`), value);
       }
-    );
-    
-    if (!response.ok) {
-      console.error('Failed to send Telegram message:', await response.text());
-    }
-  } catch (error) {
-    console.error('Telegram error:', error.message);
+    });
+    console.log(chalk.magenta('='.repeat(60) + '\n'));
   }
+  next();
 }
 
-function formatMention(data) {
-  return `
-🎯 <b>@claw Mention in Knobase</b>
-
-<b>From:</b> ${escapeHtml(data.user)}
-<b>Channel:</b> ${escapeHtml(data.channel || 'Unknown')}
-<b>Time:</b> ${new Date(data.timestamp).toLocaleString()}
-
-<b>Message:</b>
-${escapeHtml(data.message)}
-
-${data.context ? `<b>Context:</b> ${escapeHtml(data.context)}\n` : ''}
-${data.url ? `<a href="${data.url}">🔗 Open in Knobase</a>` : ''}
-  `.trim();
-}
-
-function formatNotification(data) {
-  const emoji = data.priority === 'high' ? '🔴' : data.priority === 'low' ? '⚪' : '🔵';
-  return `
-${emoji} <b>${escapeHtml(data.title || 'Notification')}</b>
-
-${escapeHtml(data.message)}
-
-<i>${new Date(data.timestamp).toLocaleString()}</i>
-  `.trim();
-}
-
-function escapeHtml(text) {
-  if (!text) return '';
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
+/**
+ * Start the webhook server
+ */
 async function startServer(port = 3456) {
   await loadConfig();
-  
+
   if (!config || !config.AGENT_ID) {
     console.error(chalk.red('❌ Not authenticated. Run: openclaw knobase auth'));
     process.exit(1);
   }
-  
+
   const app = express();
-  app.use(express.json());
-  
-  // Health check
+
+  // Middleware
+  app.use(express.json({ limit: '10mb' }));
+  app.use(requestLogger);
+  app.use(webhookLogger);
+
+  // Health check endpoint
   app.get('/health', (req, res) => {
     res.json({
       status: 'ok',
       agent: config.AGENT_ID,
+      timestamp: new Date().toISOString(),
+      version: '2.0.0'
+    });
+  });
+
+  // Status endpoint (more detailed)
+  app.get('/status', (req, res) => {
+    res.json({
+      status: 'running',
+      agent: config.AGENT_ID,
+      workspace: config.KNOBASE_WORKSPACE_ID,
+      webhookConfigured: !!config.KNOBASE_WEBHOOK_SECRET,
+      mcpEndpoint: config.KNOBASE_MCP_ENDPOINT || 'from payload',
+      uptime: process.uptime(),
       timestamp: new Date().toISOString()
     });
   });
-  
-  // Webhook endpoint
-  app.post('/webhook/knobase', async (req, res) => {
-    try {
-      const signature = req.headers['x-knobase-signature'];
-      
-      if (!verifySignature(req.body, signature, config.KNOBASE_WEBHOOK_SECRET)) {
-        console.log(chalk.red('Invalid webhook signature'));
-        return res.status(401).json({ error: 'Invalid signature' });
-      }
-      
-      const { event, data } = req.body;
-      
-      console.log(chalk.gray(`[${new Date().toISOString()}] Received ${event} event`));
-      
-      switch (event) {
-        case 'mention':
-          await sendTelegram(formatMention(data));
-          console.log(chalk.green('✓ Mention notification sent'));
-          break;
-          
-        case 'notification':
-          await sendTelegram(formatNotification(data));
-          console.log(chalk.green('✓ Notification sent'));
-          break;
-          
-        case 'system':
-          console.log(chalk.blue('System event:', data.event));
-          break;
-          
-        default:
-          console.log(chalk.yellow(`Unknown event type: ${event}`));
-      }
-      
-      res.json({ success: true });
-      
-    } catch (error) {
-      console.error(chalk.red('Webhook error:', error.message));
-      res.status(500).json({ error: 'Internal error' });
-    }
+
+  // Mount the Knobase webhook handler
+  mountWebhookHandler(app, '/webhook/knobase', {
+    webhookSecret: config.KNOBASE_WEBHOOK_SECRET
   });
-  
-  app.listen(port, () => {
-    console.log(chalk.green.bold(`🚀 Knobase webhook server running`));
-    console.log(chalk.white('Agent ID: ') + chalk.cyan(config.AGENT_ID));
-    console.log(chalk.white('Webhook URL: ') + chalk.cyan(`http://localhost:${port}/webhook/knobase`));
+
+  // Legacy endpoint for backward compatibility
+  app.post('/webhook', async (req, res) => {
+    console.log(chalk.yellow('[Webhook] Legacy endpoint used, redirecting to /webhook/knobase'));
+    res.redirect(307, '/webhook/knobase');
+  });
+
+  // 404 handler
+  app.use((req, res) => {
+    res.status(404).json({
+      error: 'Not found',
+      path: req.path,
+      timestamp: new Date().toISOString()
+    });
+  });
+
+  // Error handler (must be last)
+  app.use(errorHandler);
+
+  // Start listening
+  const server = app.listen(port, () => {
+    console.log('\n' + chalk.green.bold('🚀 Knobase Webhook Server Started'));
+    console.log(chalk.white('─'.repeat(40)));
+    console.log(chalk.white('Agent ID:     ') + chalk.cyan(config.AGENT_ID));
+    console.log(chalk.white('Port:         ') + chalk.cyan(port));
+    console.log(chalk.white('Webhook URL:  ') + chalk.cyan(`http://localhost:${port}/webhook/knobase`));
     console.log(chalk.white('Health Check: ') + chalk.cyan(`http://localhost:${port}/health`));
-    console.log(chalk.gray('\nPress Ctrl+C to stop\n'));
+    console.log(chalk.white('Status:       ') + chalk.cyan(`http://localhost:${port}/status`));
+    console.log(chalk.white('─'.repeat(40)));
+    
+    if (!config.KNOBASE_WEBHOOK_SECRET) {
+      console.log(chalk.yellow('\n⚠️  Warning: KNOBASE_WEBHOOK_SECRET not configured'));
+      console.log(chalk.yellow('   Webhook signature verification is disabled\n'));
+    } else {
+      console.log(chalk.green('\n✓ Webhook signature verification enabled\n'));
+    }
+    
+    console.log(chalk.gray('Press Ctrl+C to stop\n'));
   });
+
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log(chalk.yellow('\n[Server] SIGTERM received, shutting down...'));
+    server.close(() => {
+      console.log(chalk.green('[Server] Shut down complete'));
+      process.exit(0);
+    });
+  });
+
+  process.on('SIGINT', () => {
+    console.log(chalk.yellow('\n[Server] SIGINT received, shutting down...'));
+    server.close(() => {
+      console.log(chalk.green('[Server] Shut down complete'));
+      process.exit(0);
+    });
+  });
+
+  return server;
 }
 
 // Parse arguments
 const args = process.argv.slice(2);
 const portIndex = args.indexOf('--port');
-const port = portIndex !== -1 ? parseInt(args[portIndex + 1]) : (process.env.WEBHOOK_PORT || 3456);
+const port = portIndex !== -1 
+  ? parseInt(args[portIndex + 1]) 
+  : (process.env.WEBHOOK_PORT || process.env.PORT || 3456);
 
-startServer(port);
+const daemonIndex = args.indexOf('--daemon');
+const isDaemon = daemonIndex !== -1;
+
+if (args[0] === 'start' || args.length === 0) {
+  startServer(port);
+} else if (args[0] === '--help' || args[0] === '-h') {
+  console.log(`
+${chalk.bold('Knobase Webhook Server')}
+
+Usage: openclaw knobase webhook start [options]
+
+Options:
+  --port <port>   Port to listen on (default: 3456)
+  --daemon        Run as daemon (not implemented yet)
+  --help, -h      Show this help message
+
+Environment Variables:
+  KNOBASE_WEBHOOK_SECRET  Secret for HMAC signature verification
+  KNOBASE_MCP_ENDPOINT    Default MCP endpoint (optional, can be in payload)
+  WEBHOOK_PORT            Default port (can be overridden with --port)
+`);
+} else {
+  console.log(chalk.red(`Unknown command: ${args[0]}`));
+  console.log(chalk.gray('Run with --help for usage information'));
+  process.exit(1);
+}

@@ -65,6 +65,7 @@
     "minOpenClawVersion": "0.1.0",
     "commands": [
       "knobase auth",
+      "knobase configure",
       "knobase connect",
       "knobase status",
       "knobase webhook start"

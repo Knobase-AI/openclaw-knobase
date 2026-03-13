@@ -4,12 +4,13 @@
  * Knobase Authentication Script
  * 
  * Usage: openclaw knobase auth
+ *        openclaw knobase auth --api-key <key>
  * 
- * This script:
- * 1. Generates a unique Agent ID
- * 2. Prompts for Knobase API credentials
- * 3. Validates credentials with Knobase API
- * 4. Stores configuration securely
+ * Implements OAuth 2.0 Device Code Flow:
+ * 1. Requests device + user codes from Knobase
+ * 2. Displays user_code and verification URL
+ * 3. Polls for token grant
+ * 4. Connects agent and saves credentials
  */
 
 import fs from 'fs/promises';
@@ -17,227 +18,209 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import chalk from 'chalk';
-import inquirer from 'inquirer';
 import ora from 'ora';
+import fetch from 'node-fetch';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_DIR = path.resolve(__dirname, '..');
 const ENV_FILE = path.join(SKILL_DIR, '.env');
-const CONFIG_FILE = path.join(SKILL_DIR, 'config.json');
 
-// Generate unique Agent ID
+const KNOBASE_BASE_URL = 'https://app.knobase.com';
+const DEVICE_CODE_URL = `${KNOBASE_BASE_URL}/api/oauth/device/code`;
+const DEVICE_TOKEN_URL = `${KNOBASE_BASE_URL}/api/oauth/device/token`;
+const AGENT_CONNECT_URL = `${KNOBASE_BASE_URL}/api/v1/agents/connect`;
+const POLL_INTERVAL_MS = 5000;
+
 function generateAgentId() {
   const uuid = crypto.randomUUID();
   return `knobase_agent_${uuid}`;
 }
 
-// Check if already authenticated
-async function checkExistingAuth() {
-  try {
-    const envContent = await fs.readFile(ENV_FILE, 'utf8');
-    const agentIdMatch = envContent.match(/AGENT_ID=(.+)/);
-    if (agentIdMatch) {
-      return agentIdMatch[1];
-    }
-  } catch {
-    // File doesn't exist
-  }
-  return null;
-}
-
-// Save configuration
 async function saveConfig(config) {
   const envContent = Object.entries(config)
     .map(([key, value]) => `${key}=${value}`)
     .join('\n');
   
-  await fs.writeFile(ENV_FILE, envContent, { mode: 0o600 }); // Secure permissions
+  await fs.writeFile(ENV_FILE, envContent, { mode: 0o600 });
   console.log(chalk.green('\n✓ Configuration saved to .env'));
 }
 
-// Validate API key with Knobase
-async function validateApiKey(apiKey, endpoint = 'https://api.knobase.ai') {
-  try {
-    const response = await fetch(`${endpoint}/v1/auth/validate`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      }
-    });
-    
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Invalid API key');
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  const flags = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--api-key' && args[i + 1]) {
+      flags.apiKey = args[i + 1];
+      i++;
     }
-    
-    return await response.json();
-  } catch (error) {
-    throw new Error(`Failed to validate API key: ${error.message}`);
   }
+  return flags;
 }
 
-// Register agent with Knobase
-async function registerAgent(apiKey, agentId, metadata, endpoint) {
-  try {
-    const response = await fetch(`${endpoint}/v1/agents/register`, {
+async function requestDeviceCode() {
+  const response = await fetch(DEVICE_CODE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client_id: 'openclaw-knobase-skill' }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Failed to request device code (${response.status}): ${body}`);
+  }
+
+  return await response.json();
+}
+
+async function pollForToken(deviceCode, expiresIn) {
+  const deadline = Date.now() + expiresIn * 1000;
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+
+    const response = await fetch(DEVICE_TOKEN_URL, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        agent_id: agentId,
-        name: metadata.name || 'OpenClaw Agent',
-        type: 'openclaw',
-        version: '1.0.0',
-        capabilities: ['mention_handler', 'notification_receiver', 'context_sync'],
-        platform: process.platform,
-        hostname: require('os').hostname()
-      })
+        device_code: deviceCode,
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      }),
     });
-    
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to register agent');
+
+    if (response.ok) {
+      return await response.json();
     }
-    
-    return await response.json();
-  } catch (error) {
-    throw new Error(`Agent registration failed: ${error.message}`);
+
+    const body = await response.json().catch(() => ({}));
+    const error = body.error;
+
+    if (error === 'authorization_pending') {
+      continue;
+    } else if (error === 'slow_down') {
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      continue;
+    } else if (error === 'expired_token') {
+      throw new Error('Device code expired. Please try again.');
+    } else if (error === 'access_denied') {
+      throw new Error('Authorization request was denied.');
+    } else {
+      throw new Error(`Token request failed: ${error || response.statusText}`);
+    }
   }
+
+  throw new Error('Device code expired. Please try again.');
 }
 
-// Main authentication flow
-async function authenticate() {
-  console.log(chalk.blue.bold('🔌 Knobase Authentication\n'));
-  
-  // Check existing auth
-  const existingAgentId = await checkExistingAuth();
-  if (existingAgentId) {
-    const { overwrite } = await inquirer.prompt([{
-      type: 'confirm',
-      name: 'overwrite',
-      message: `Agent already authenticated (${existingAgentId.slice(0, 20)}...). Re-authenticate?`,
-      default: false
-    }]);
-    
-    if (!overwrite) {
-      console.log(chalk.yellow('Authentication cancelled.'));
-      return;
-    }
+async function connectAgent(deviceCode) {
+  const response = await fetch(AGENT_CONNECT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_code: deviceCode }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Failed to connect agent (${response.status}): ${body}`);
   }
-  
-  // Generate new Agent ID
-  const agentId = generateAgentId();
-  console.log(chalk.gray(`Generated Agent ID: ${agentId}\n`));
-  
-  // Collect credentials
-  const answers = await inquirer.prompt([
-    {
-      type: 'input',
-      name: 'apiKey',
-      message: 'Enter your Knobase API Key:',
-      validate: (input) => input.length > 0 || 'API Key is required'
-    },
-    {
-      type: 'input',
-      name: 'endpoint',
-      message: 'Knobase API Endpoint:',
-      default: 'https://api.knobase.ai'
-    },
-    {
-      type: 'input',
-      name: 'agentName',
-      message: 'Agent Name (optional):',
-      default: `OpenClaw ${require('os').hostname()}`
-    },
-    {
-      type: 'confirm',
-      name: 'webhookSetup',
-      message: 'Do you want to set up webhook notifications?',
-      default: true
-    }
-  ]);
-  
-  // Validate API key
-  const spinner = ora('Validating API key...').start();
-  
+
+  return await response.json();
+}
+
+async function authenticateWithDeviceFlow() {
+  console.log(chalk.blue.bold('\n🔌 Knobase Authentication\n'));
+  console.log(chalk.gray('Using OAuth 2.0 Device Code Flow\n'));
+
+  const codeSpinner = ora('Requesting device code...').start();
+  let deviceData;
   try {
-    const validation = await validateApiKey(answers.apiKey, answers.endpoint);
-    spinner.succeed('API key validated');
-    
-    // Register agent
-    const registerSpinner = ora('Registering agent with Knobase...').start();
-    const registration = await registerAgent(
-      answers.apiKey, 
-      agentId, 
-      { name: answers.agentName },
-      answers.endpoint
-    );
-    registerSpinner.succeed('Agent registered');
-    
-    // Build config
-    const config = {
-      AGENT_ID: agentId,
-      KNOBASE_API_KEY: answers.apiKey,
-      KNOBASE_API_ENDPOINT: answers.endpoint,
-      KNOBASE_WORKSPACE_ID: validation.workspace_id || '',
-      AGENT_NAME: answers.agentName,
-      AUTHENTICATED_AT: new Date().toISOString()
-    };
-    
-    // Optional webhook config
-    if (answers.webhookSetup) {
-      const webhookAnswers = await inquirer.prompt([
-        {
-          type: 'input',
-          name: 'webhookSecret',
-          message: 'Webhook Secret (for verification):',
-          default: crypto.randomBytes(32).toString('hex')
-        },
-        {
-          type: 'input',
-          name: 'telegramToken',
-          message: 'Telegram Bot Token (for notifications):',
-          validate: (input) => input.length > 0 || 'Bot token is required for notifications'
-        },
-        {
-          type: 'input',
-          name: 'telegramChatId',
-          message: 'Telegram Chat ID:',
-          validate: (input) => input.length > 0 || 'Chat ID is required'
-        }
-      ]);
-      
-      config.KNOBASE_WEBHOOK_SECRET = webhookAnswers.webhookSecret;
-      config.TELEGRAM_BOT_TOKEN = webhookAnswers.telegramToken;
-      config.TELEGRAM_CHAT_ID = webhookAnswers.telegramChatId;
-      config.WEBHOOK_PORT = '3456';
-    }
-    
-    // Save configuration
-    await saveConfig(config);
-    
-    console.log(chalk.green.bold('\n✅ Authentication successful!\n'));
-    console.log(chalk.white('Agent ID: ') + chalk.cyan(agentId));
-    console.log(chalk.white('Workspace: ') + chalk.cyan(validation.workspace_name || 'Unknown'));
-    console.log(chalk.white('Connected as: ') + chalk.cyan(answers.agentName));
-    
-    if (answers.webhookSetup) {
-      console.log(chalk.gray('\nTo start receiving notifications:'));
-      console.log(chalk.gray('  openclaw knobase webhook start'));
-    }
-    
-    console.log(chalk.gray('\nTo connect to a workspace:'));
-    console.log(chalk.gray('  openclaw knobase connect\n'));
-    
-  } catch (error) {
-    spinner.fail('Authentication failed');
-    console.error(chalk.red(error.message));
+    deviceData = await requestDeviceCode();
+    codeSpinner.succeed('Device code received');
+  } catch (err) {
+    codeSpinner.fail('Failed to request device code');
+    console.error(chalk.red(err.message));
     process.exit(1);
   }
+
+  const { device_code, user_code, verification_uri, expires_in } = deviceData;
+  const verificationUrl = verification_uri || `${KNOBASE_BASE_URL}/activate`;
+
+  console.log('');
+  console.log(chalk.white.bold('  Open this URL in your browser:'));
+  console.log(chalk.cyan.bold(`  ${verificationUrl}\n`));
+  console.log(chalk.white.bold('  Enter this code:'));
+  console.log(chalk.yellow.bold(`  ${user_code}\n`));
+  console.log(chalk.gray(`  Code expires in ${Math.floor(expires_in / 60)} minutes.\n`));
+
+  const tokenSpinner = ora('Waiting for authorization...').start();
+  let tokenData;
+  try {
+    tokenData = await pollForToken(device_code, expires_in);
+    tokenSpinner.succeed('Authorization granted');
+  } catch (err) {
+    tokenSpinner.fail('Authorization failed');
+    console.error(chalk.red(err.message));
+    process.exit(1);
+  }
+
+  const connectSpinner = ora('Connecting agent to workspace...').start();
+  let agentData;
+  try {
+    agentData = await connectAgent(device_code);
+    connectSpinner.succeed('Agent connected');
+  } catch (err) {
+    connectSpinner.fail('Failed to connect agent');
+    console.error(chalk.red(err.message));
+    process.exit(1);
+  }
+
+  const { agent_id, api_key, workspace_id } = agentData;
+
+  const config = {
+    AGENT_ID: agent_id || generateAgentId(),
+    KNOBASE_API_KEY: api_key,
+    KNOBASE_WORKSPACE_ID: workspace_id,
+    KNOBASE_API_ENDPOINT: KNOBASE_BASE_URL,
+    AUTHENTICATED_AT: new Date().toISOString(),
+  };
+
+  await saveConfig(config);
+
+  console.log(chalk.green.bold('\n✅ Authentication successful!\n'));
+  console.log(chalk.white('  Agent ID:    ') + chalk.cyan(config.AGENT_ID));
+  console.log(chalk.white('  Workspace:   ') + chalk.cyan(workspace_id));
+  console.log(chalk.gray('\n  Run `openclaw knobase status` to verify your connection.\n'));
 }
 
-// Run authentication
-authenticate().catch(console.error);
+async function authenticateWithApiKey(apiKey) {
+  console.log(chalk.blue.bold('\n🔌 Knobase Authentication\n'));
+  console.log(chalk.gray('Using API key fallback\n'));
+
+  const agentId = generateAgentId();
+  const config = {
+    AGENT_ID: agentId,
+    KNOBASE_API_KEY: apiKey,
+    KNOBASE_API_ENDPOINT: KNOBASE_BASE_URL,
+    AUTHENTICATED_AT: new Date().toISOString(),
+  };
+
+  await saveConfig(config);
+
+  console.log(chalk.green.bold('\n✅ API key saved!\n'));
+  console.log(chalk.white('  Agent ID: ') + chalk.cyan(agentId));
+  console.log(chalk.gray('\n  Run `openclaw knobase status` to verify your connection.\n'));
+}
+
+async function main() {
+  const flags = parseArgs(process.argv);
+
+  if (flags.apiKey) {
+    await authenticateWithApiKey(flags.apiKey);
+  } else {
+    await authenticateWithDeviceFlow();
+  }
+}
+
+main().catch((err) => {
+  console.error(chalk.red(err.message));
+  process.exit(1);
+});
