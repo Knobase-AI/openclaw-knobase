@@ -20,7 +20,16 @@ const COMMANDS = {
   'status': 'status.js',
   'webhook': 'webhook.js',
   'setup': 'setup.js',
+  'mention': 'mention.js',
+  'workspace': 'workspace.js',
   'docs': null, // routed to docs subcommands
+  'agents': null, // routed to agents subcommands
+};
+
+const AGENTS_SUBCOMMANDS = {
+  'list': { script: 'agents/list.js', desc: 'List all agents in the workspace' },
+  'info': { script: 'agents/info.js', desc: 'Get current agent\'s profile information' },
+  'find': { script: 'agents/find.js', desc: 'Find collaborators by capability or expertise' },
 };
 
 const DOCS_SUBCOMMANDS = {
@@ -47,8 +56,12 @@ function showMainHelp() {
   console.log(chalk.gray('  webhook    Start webhook server'));
   console.log(chalk.gray('  setup      One-command auth + webhook start (--auto, --doc <url>)'));
   console.log(chalk.gray('  docs       Manage workspace documents (list, read, search, create, write, delete, export)'));
+  console.log(chalk.gray('  agents     Manage workspace agents (list, info, find)'));
+  console.log(chalk.gray('  workspace  Show workspace information'));
+  console.log(chalk.gray('  mention    Create a @mention in a document'));
   console.log(chalk.gray('  --help     Show this help message\n'));
   console.log(chalk.gray('Run "openclaw knobase docs --help" for document subcommands.'));
+  console.log(chalk.gray('Run "openclaw knobase agents --help" for agent subcommands.'));
   process.exit(0);
 }
 
@@ -72,6 +85,22 @@ function showDocsHelp() {
   console.log(chalk.gray('  openclaw knobase docs write abc123 append "New paragraph"'));
   console.log(chalk.gray('  openclaw knobase docs delete abc123'));
   console.log(chalk.gray('  openclaw knobase docs export abc123 --format png'));
+  process.exit(0);
+}
+
+function showAgentsHelp() {
+  console.log(chalk.blue.bold('Knobase Agent Commands\n'));
+  console.log(chalk.white('Usage: openclaw knobase agents <subcommand>\n'));
+  console.log(chalk.white('Subcommands:'));
+  console.log(chalk.gray('  list                  List all agents in the workspace'));
+  console.log(chalk.gray('  info                  Get current agent\'s profile information'));
+  console.log(chalk.gray('  find <query>          Find collaborators by capability or expertise'));
+  console.log(chalk.gray('  --help                Show this help message\n'));
+  console.log(chalk.gray('Examples:'));
+  console.log(chalk.gray('  openclaw knobase agents list'));
+  console.log(chalk.gray('  openclaw knobase agents info'));
+  console.log(chalk.gray('  openclaw knobase agents find "code review"'));
+  console.log(chalk.gray('  openclaw knobase agents find python backend'));
   process.exit(0);
 }
 
@@ -100,6 +129,29 @@ if (command === 'docs') {
   }
 
   const scriptPath = path.join(__dirname, DOCS_SUBCOMMANDS[subcommand].script);
+  const child = spawn('node', [scriptPath, ...subArgs], {
+    stdio: 'inherit',
+    cwd: process.cwd()
+  });
+
+  child.on('exit', (code) => {
+    process.exit(code);
+  });
+} else if (command === 'agents') {
+  const subcommand = args[0];
+  const subArgs = args.slice(1);
+
+  if (!subcommand || subcommand === '--help' || subcommand === '-h') {
+    showAgentsHelp();
+  }
+
+  if (!(subcommand in AGENTS_SUBCOMMANDS)) {
+    console.error(chalk.red(`Unknown agents subcommand: ${subcommand}`));
+    console.log(chalk.gray('Run "openclaw knobase agents --help" for available subcommands'));
+    process.exit(1);
+  }
+
+  const scriptPath = path.join(__dirname, AGENTS_SUBCOMMANDS[subcommand].script);
   const child = spawn('node', [scriptPath, ...subArgs], {
     stdio: 'inherit',
     cwd: process.cwd()
