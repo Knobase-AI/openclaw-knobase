@@ -1,6 +1,6 @@
 {
   "name": "openclaw-knobase",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Official OpenClaw skill for Knobase integration - connect your agent to Knobase workspaces",
   "main": "src/index.js",
   "type": "module",
@@ -63,7 +63,7 @@
     "skillName": "knobase",
     "displayName": "Knobase Integration",
     "description": "Connect OpenClaw to Knobase workspaces for @mentions and notifications",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "author": "Knobase",
     "minOpenClawVersion": "0.1.0",
     "commands": [
