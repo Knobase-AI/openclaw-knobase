@@ -28,6 +28,9 @@ const DOCS_SUBCOMMANDS = {
   'read':   { script: 'docs/read.js',   desc: 'Read a specific document by ID' },
   'search': { script: 'docs/search.js', desc: 'Search documents by query' },
   'create': { script: 'docs/create.js', desc: 'Create a new document' },
+  'write':  { script: 'docs/write.js',  desc: 'Edit a document with block operations' },
+  'delete': { script: 'docs/delete.js', desc: 'Delete a document by ID' },
+  'export': { script: 'docs/export.js', desc: 'Export a document to PNG/JPEG/PDF' },
 };
 
 const command = process.argv[2];
@@ -43,7 +46,7 @@ function showMainHelp() {
   console.log(chalk.gray('  status     Check connection status'));
   console.log(chalk.gray('  webhook    Start webhook server'));
   console.log(chalk.gray('  setup      One-command auth + webhook start (--auto, --doc <url>)'));
-  console.log(chalk.gray('  docs       Manage workspace documents (list, read, search, create)'));
+  console.log(chalk.gray('  docs       Manage workspace documents (list, read, search, create, write, delete, export)'));
   console.log(chalk.gray('  --help     Show this help message\n'));
   console.log(chalk.gray('Run "openclaw knobase docs --help" for document subcommands.'));
   process.exit(0);
@@ -57,12 +60,18 @@ function showDocsHelp() {
   console.log(chalk.gray('  read <id>                        Read a specific document by ID'));
   console.log(chalk.gray('  search <query>                   Search documents by query'));
   console.log(chalk.gray('  create <title> [--content <c>]   Create a new document'));
+  console.log(chalk.gray('  write <id> <op> <content>        Edit a document with block operations'));
+  console.log(chalk.gray('  delete <id> [--force]            Delete a document by ID'));
+  console.log(chalk.gray('  export <id> [--format <fmt>]     Export a document to PNG/JPEG/PDF'));
   console.log(chalk.gray('  --help                           Show this help message\n'));
   console.log(chalk.gray('Examples:'));
   console.log(chalk.gray('  openclaw knobase docs list'));
   console.log(chalk.gray('  openclaw knobase docs read abc123'));
   console.log(chalk.gray('  openclaw knobase docs search "project roadmap"'));
   console.log(chalk.gray('  openclaw knobase docs create "Meeting Notes" --content "Agenda items"'));
+  console.log(chalk.gray('  openclaw knobase docs write abc123 append "New paragraph"'));
+  console.log(chalk.gray('  openclaw knobase docs delete abc123'));
+  console.log(chalk.gray('  openclaw knobase docs export abc123 --format png'));
   process.exit(0);
 }
 
