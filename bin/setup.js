@@ -180,7 +180,7 @@ async function runDeviceCodeAuth() {
   }
 
   const { device_code, user_code, verification_uri, expires_in } = deviceData;
-  const verificationUrl = `${KNOBASE_BASE_URL}/device?code=${user_code}`;
+  const verificationUrl = `${KNOBASE_BASE_URL}/oauth/device?code=${user_code}`;
 
   console.log('');
   console.log(chalk.white.bold('  Your code:'));
