@@ -18,7 +18,8 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createInterface } from 'readline';
+import readline from 'readline';
+const { createInterface } = readline;
 import { spawn } from 'child_process';
 import crypto from 'crypto';
 import chalk from 'chalk';
@@ -234,10 +235,93 @@ async function runDeviceCodeAuth() {
   return config;
 }
 
+// ── Brain mode selector (arrow keys) ─────────────────────────
+
+function selectBrainMode() {
+  const options = [
+    { label: 'Knobase cloud', value: 'cloud', desc: 'Sync knowledge to cloud — access from any device' },
+    { label: 'Local only',    value: 'local', desc: 'Keep everything on this machine' },
+  ];
+
+  return new Promise((resolve) => {
+    let selected = 0;
+
+    const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    readline.emitKeypressEvents(process.stdin, rl);
+
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
+
+    process.stdout.write('\x1B[?25l');
+
+    let rendered = false;
+
+    function render() {
+      if (rendered) {
+        process.stdout.write(`\x1B[${options.length}A`);
+      }
+      rendered = true;
+
+      for (let i = 0; i < options.length; i++) {
+        const pointer = i === selected ? chalk.cyan('▶ ') : '  ';
+        const label = i === selected
+          ? chalk.white.bold(options[i].label) + chalk.gray('  ' + options[i].desc)
+          : chalk.gray(options[i].label + '  ' + options[i].desc);
+        process.stdout.write('\x1B[2K' + pointer + label + '\n');
+      }
+    }
+
+    render();
+
+    function onKeypress(_ch, key) {
+      if (!key) return;
+
+      if (key.name === 'up') {
+        selected = (selected - 1 + options.length) % options.length;
+        render();
+      } else if (key.name === 'down') {
+        selected = (selected + 1) % options.length;
+        render();
+      } else if (key.name === 'return') {
+        cleanup();
+        resolve(options[selected].value);
+      } else if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+        cleanup();
+        console.log(chalk.yellow('\n  Selection cancelled.'));
+        process.exit(0);
+      }
+    }
+
+    function cleanup() {
+      process.stdout.write('\x1B[?25h');
+      process.stdin.removeListener('keypress', onKeypress);
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      rl.close();
+    }
+
+    process.stdin.on('keypress', onKeypress);
+  });
+}
+
+async function promptBrainMode(auto) {
+  if (auto) {
+    return 'cloud';
+  }
+
+  console.log(chalk.white.bold('\n  How should your code editor connect to Knobase?\n'));
+  console.log(chalk.gray('  Use ↑↓ to select, Enter to confirm\n'));
+
+  const mode = await selectBrainMode();
+  console.log(chalk.green(`\n  ✓ ${mode === 'cloud' ? 'Knobase cloud' : 'Local only'}\n`));
+  return mode;
+}
+
 // ── Webhook launcher ─────────────────────────────────────────
 
 function launchWebhook() {
-  console.log('');
   const webhookPath = path.join(__dirname, 'webhook.js');
   const child = spawn(process.execPath, [webhookPath, 'start'], {
     stdio: 'inherit',
@@ -249,24 +333,45 @@ function launchWebhook() {
   });
 }
 
-async function promptOrAutoStartWebhook(auto) {
+// ── Daemon launcher ──────────────────────────────────────────
+
+function launchDaemon() {
+  const daemonPath = path.join(__dirname, 'daemon.js');
+  const child = spawn(process.execPath, [daemonPath, 'start'], {
+    stdio: 'inherit',
+    cwd: SKILL_DIR,
+  });
+  child.on('error', (err) => {
+    console.error(chalk.red(`\n  Failed to start daemon: ${err.message}`));
+    console.log(chalk.gray('  You can start it manually with: openclaw knobase daemon start\n'));
+  });
+}
+
+// ── Start services (both daemon + webhook) ───────────────────
+
+async function startServices(auto) {
   if (auto) {
-    console.log(chalk.gray('\n  --auto flag detected, starting webhook server...\n'));
+    console.log(chalk.gray('\n  --auto flag detected, starting services...\n'));
+    launchDaemon();
     launchWebhook();
     return;
   }
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const answer = await new Promise((resolve) => {
-    rl.question(chalk.white.bold('  Start webhook server now? [Y/n] '), resolve);
+    rl.question(chalk.white.bold('  Start daemon + webhook now? [Y/n] '), resolve);
   });
   rl.close();
 
   const shouldStart = !answer || answer.trim().toLowerCase() !== 'n';
   if (shouldStart) {
+    console.log('');
+    launchDaemon();
     launchWebhook();
   } else {
-    console.log(chalk.gray('\n  You can start the webhook later with: openclaw knobase webhook start\n'));
+    console.log(chalk.gray('\n  You can start them later with:'));
+    console.log(chalk.gray('    openclaw knobase daemon start'));
+    console.log(chalk.gray('    openclaw knobase webhook start\n'));
   }
 }
 
@@ -318,13 +423,16 @@ async function main() {
     config = await runDeviceCodeAuth();
   }
 
-  // Step 2: Show success
+  // Step 2: Brain mode selection
+  const brainMode = await promptBrainMode(flags.auto);
+
+  // Step 3: Show success
   showSuccess(config, flags.doc);
 
-  // Step 3: Start webhook
-  await promptOrAutoStartWebhook(flags.auto);
+  // Step 4: Start both daemon + webhook
+  await startServices(flags.auto);
 
-  // Step 4: Configure heartbeat
+  // Step 5: Configure heartbeat
   await configureHeartbeat();
 }
 
@@ -364,4 +472,74 @@ async function configureHeartbeat() {
   } catch (err) {
     console.log(chalk.yellow('  ⚠ Could not configure heartbeat: ' + err.message));
   }
+}
+
+async function promptBrainMode() {
+  console.log(chalk.blue.bold('\n☁️  Where should your agent\'s brain live?\n'));
+  console.log(chalk.gray('Use ↑↓ to select, Enter to confirm\n'));
+
+  const options = [
+    { 
+      key: 'brain', 
+      label: '🧠 Knobase Cloud (Recommended)',
+      description: 'Edit in browser. Auto-sync. Never lose work. Access anywhere.'
+    },
+    { 
+      key: 'local', 
+      label: '📁 This computer only',
+      description: 'Edit with code editor. Manual sync.'
+    }
+  ];
+
+  let selectedIndex = 0;
+
+  // Simple arrow key selection
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  const render = () => {
+    console.clear();
+    console.log(chalk.blue.bold('\n☁️  Where should your agent\'s brain live?\n'));
+    console.log(chalk.gray('Use ↑↓ to select, Enter to confirm\n'));
+    
+    options.forEach((opt, i) => {
+      if (i === selectedIndex) {
+        console.log(chalk.cyan.bold(`▶ ${opt.label}`));
+        console.log(chalk.cyan(`  ${opt.description}`));
+      } else {
+        console.log(chalk.gray(`  ${opt.label}`));
+        console.log(chalk.gray(`  ${opt.description}`));
+      }
+      console.log();
+    });
+  };
+
+  render();
+
+  return new Promise((resolve) => {
+    process.stdin.on('keypress', (str, key) => {
+      if (key.name === 'up' && selectedIndex > 0) {
+        selectedIndex--;
+        render();
+      } else if (key.name === 'down' && selectedIndex < options.length - 1) {
+        selectedIndex++;
+        render();
+      } else if (key.name === 'return') {
+        process.stdin.removeAllListeners('keypress');
+        rl.close();
+        
+        const choice = options[selectedIndex].key;
+        
+        if (choice === 'brain') {
+          console.log(chalk.green('\n🚀 Enabling Knobase Brain Mode...'));
+          resolve('brain');
+        } else {
+          console.log(chalk.yellow('\nℹ️  Local mode selected.'));
+          resolve('local');
+        }
+      }
+    });
+  });
 }
