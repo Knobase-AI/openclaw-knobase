@@ -14,9 +14,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import chalk from 'chalk';
 import { mountWebhookHandler } from '../src/webhook-handler.js';
+import { createRequire } from 'module';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_DIR = path.resolve(__dirname, '..');
+const require = createRequire(import.meta.url);
+const pkg = require('../package.json');
 const ENV_FILE = path.join(SKILL_DIR, '.env');
 
 let config = null;
@@ -114,13 +117,24 @@ async function startServer(port = 3456) {
   app.use(requestLogger);
   app.use(webhookLogger);
 
-  // Health check endpoint
+  // Health check endpoint (basic GET)
   app.get('/health', (req, res) => {
     res.json({
       status: 'ok',
       agent: config.AGENT_ID,
       timestamp: new Date().toISOString(),
-      version: '2.0.0'
+      version: pkg.version
+    });
+  });
+
+  // Health check endpoint for Knobase presence verification (POST)
+  app.post('/health', (req, res) => {
+    res.status(200).json({
+      status: 'healthy',
+      agent_id: config.AGENT_ID,
+      uptime: process.uptime(),
+      timestamp: Date.now(),
+      version: pkg.version
     });
   });
 

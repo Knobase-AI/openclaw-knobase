@@ -37,6 +37,8 @@ const DEBOUNCE_MS = 500;
 const POLL_INTERVAL_MS = 5000;
 const RETRY_INTERVAL_MS = 10000;
 const MAX_RETRY_ATTEMPTS = 10;
+const HEARTBEAT_INTERVAL_MS = 60_000;
+const HEARTBEAT_MAX_RETRIES = 5;
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -333,6 +335,76 @@ class CloudPoller {
   }
 }
 
+// ─── HeartbeatManager — periodic presence heartbeat ───────────────────────────
+
+class HeartbeatManager {
+  #interval = null;
+  #config;
+  #logger;
+  #retryCount = 0;
+
+  constructor(config, logger) {
+    this.#config = config;
+    this.#logger = logger;
+  }
+
+  async start() {
+    this.#logger.info('HeartbeatManager starting');
+    await this.#send();
+    this.#interval = setInterval(() => this.#send(), HEARTBEAT_INTERVAL_MS);
+  }
+
+  async #send() {
+    const { KNOBASE_API_KEY: apiKey, KNOBASE_API_ENDPOINT: baseUrl } = this.#config;
+    if (!apiKey) return;
+
+    const endpoint = `${baseUrl || 'https://app.knobase.com'}/api/presence/heartbeat`;
+    const payload = {
+      timestamp: Date.now(),
+      status: 'healthy',
+      uptime: process.uptime(),
+    };
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      this.#logger.info('Heartbeat sent');
+      this.#retryCount = 0;
+    } catch (err) {
+      this.#retryCount++;
+      if (this.#retryCount > HEARTBEAT_MAX_RETRIES) {
+        this.#logger.warn(`Heartbeat failed after ${HEARTBEAT_MAX_RETRIES} retries, will resume next interval: ${err.message}`);
+        this.#retryCount = 0;
+        return;
+      }
+
+      const backoffMs = Math.min(1000 * 2 ** this.#retryCount, 30_000);
+      this.#logger.warn(`Heartbeat failed (attempt ${this.#retryCount}/${HEARTBEAT_MAX_RETRIES}), retrying in ${backoffMs}ms: ${err.message}`);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      return this.#send();
+    }
+  }
+
+  stop() {
+    if (this.#interval) {
+      clearInterval(this.#interval);
+      this.#interval = null;
+    }
+    this.#logger.info('HeartbeatManager stopped');
+  }
+}
+
 // ─── Daemon ───────────────────────────────────────────────────────────────────
 
 class Daemon {
@@ -340,6 +412,7 @@ class Daemon {
   #queue;
   #watcher;
   #poller;
+  #heartbeat;
   #retryTimer = null;
   #online = true;
   #config;
@@ -378,6 +451,9 @@ class Daemon {
     });
     this.#poller.start();
 
+    this.#heartbeat = new HeartbeatManager(this.#config, this.#logger);
+    await this.#heartbeat.start();
+
     this.#drainQueue();
 
     process.on('SIGTERM', () => this.stop());
@@ -391,6 +467,7 @@ class Daemon {
 
     if (this.#watcher) this.#watcher.stop();
     if (this.#poller) this.#poller.stop();
+    if (this.#heartbeat) this.#heartbeat.stop();
     if (this.#retryTimer) clearTimeout(this.#retryTimer);
 
     await this.#queue.save();
