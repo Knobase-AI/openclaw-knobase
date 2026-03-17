@@ -27,11 +27,16 @@ const COMMANDS = {
   'setup': 'setup.js',
   'mention': 'mention.js',
   'workspace': 'workspace.js',
+  'daemon': 'daemon.js',
   'export': 'export.js',
   'import': 'import.js',
   'docs': null, // routed to docs subcommands
   'agents': null, // routed to agents subcommands
   'daemon': null, // routed to daemon subcommands
+};
+
+const DAEMON_SUBCOMMANDS = {
+  'install': { script: 'daemon-install.js', desc: 'Install daemon as a system service (auto-start on boot)' },
 };
 
 const AGENTS_SUBCOMMANDS = {
@@ -279,6 +284,18 @@ function daemonRestart(extraArgs) {
   process.exit(0);
 }
 
+function showDaemonHelp() {
+  console.log(chalk.blue.bold('Knobase Daemon Commands\n'));
+  console.log(chalk.white('Usage: openclaw-knobase daemon <subcommand>\n'));
+  console.log(chalk.white('Subcommands:'));
+  console.log(chalk.gray('  install [--uninstall]   Install or uninstall daemon as system service'));
+  console.log(chalk.gray('  --help                  Show this help message\n'));
+  console.log(chalk.gray('Examples:'));
+  console.log(chalk.gray('  openclaw-knobase daemon install'));
+  console.log(chalk.gray('  openclaw-knobase daemon install --uninstall'));
+  process.exit(0);
+}
+
 if (!command || command === '--help' || command === '-h') {
   showMainHelp();
 }
@@ -312,6 +329,25 @@ if (command === 'docs') {
   child.on('exit', (code) => {
     process.exit(code);
   });
+} else if (command === 'daemon') {
+  const subcommand = args[0];
+  const subArgs = args.slice(1);
+
+  if (!subcommand || subcommand === '--help' || subcommand === '-h') {
+    showDaemonHelp();
+  }
+
+  switch (subcommand) {
+    case 'start':   daemonStart(subArgs);   break;
+    case 'stop':    daemonStop();            break;
+    case 'status':  daemonStatus();          break;
+    case 'logs':    daemonLogs();            break;
+    case 'restart': daemonRestart(subArgs);  break;
+    default:
+      console.error(chalk.red(`Unknown daemon subcommand: ${subcommand}`));
+      console.log(chalk.gray('Run "openclaw-knobase daemon --help" for available subcommands'));
+      process.exit(1);
+  }
 } else if (command === 'agents') {
   const subcommand = args[0];
   const subArgs = args.slice(1);
@@ -327,6 +363,29 @@ if (command === 'docs') {
   }
 
   const scriptPath = path.join(__dirname, AGENTS_SUBCOMMANDS[subcommand].script);
+  const child = spawn('node', [scriptPath, ...subArgs], {
+    stdio: 'inherit',
+    cwd: process.cwd()
+  });
+
+  child.on('exit', (code) => {
+    process.exit(code);
+  });
+} else if (command === 'daemon') {
+  const subcommand = args[0];
+  const subArgs = args.slice(1);
+
+  if (!subcommand || subcommand === '--help' || subcommand === '-h') {
+    showDaemonHelp();
+  }
+
+  if (!(subcommand in DAEMON_SUBCOMMANDS)) {
+    console.error(chalk.red(`Unknown daemon subcommand: ${subcommand}`));
+    console.log(chalk.gray('Run "openclaw-knobase daemon --help" for available subcommands'));
+    process.exit(1);
+  }
+
+  const scriptPath = path.join(__dirname, DAEMON_SUBCOMMANDS[subcommand].script);
   const child = spawn('node', [scriptPath, ...subArgs], {
     stdio: 'inherit',
     cwd: process.cwd()
