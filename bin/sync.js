@@ -21,8 +21,6 @@ const ENV_FILE = path.join(SKILL_DIR, '.env');
 
 const WORKSPACE_DIR = path.join(os.homedir(), '.openclaw', 'workspace');
 
-const SYNCABLE_EXTENSIONS = new Set(['.md', '.txt', '.json', '.yaml', '.yml', '.toml']);
-
 // --- Argument parsing ---
 
 const args = process.argv.slice(2);
@@ -103,7 +101,7 @@ async function readLocalFiles(workspaceDir) {
 
       if (entry.isDirectory()) {
         await walk(fullPath, relativePath);
-      } else if (entry.isFile() && SYNCABLE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+      } else if (entry.isFile()) {
         try {
           const content = await fs.readFile(fullPath, 'utf8');
           const stat = await fs.stat(fullPath);
@@ -298,6 +296,7 @@ async function sync() {
   console.log(chalk.gray(`  Agent:     ${syncAgentId}`));
   console.log(chalk.gray(`  Workspace: ${workspaceDir}`));
   console.log(chalk.gray(`  Direction: ${direction}`));
+  console.log(chalk.gray(`  Filter:    all files`));
   if (dryRun) {
     console.log(chalk.yellow('  Mode:      DRY RUN (no changes will be applied)'));
   }
@@ -310,8 +309,8 @@ async function sync() {
   if (direction !== 'down') {
     try {
       localFiles = await readLocalFiles(workspaceDir);
-      const fileCount = Object.keys(localFiles).length;
-      readSpinner.succeed(`Found ${fileCount} local file(s)`);
+      const allPaths = Object.keys(localFiles);
+      readSpinner.succeed(`Found ${allPaths.length} local file(s)`);
     } catch (err) {
       readSpinner.warn('Could not read local workspace');
       console.log(chalk.gray(`  ${err.message}\n`));
@@ -334,8 +333,8 @@ async function sync() {
   }
 
   const uploaded = syncResult.uploaded || [];
-  const downloads = syncResult.downloads || [];
-  const conflicts = syncResult.conflicts || [];
+  let downloads = syncResult.downloads || [];
+  let conflicts = syncResult.conflicts || [];
   const unchanged = syncResult.unchanged || [];
 
   // Display uploaded files

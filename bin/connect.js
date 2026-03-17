@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 
 /**
- * Knobase One-Click Agent Connection
- * 
- * Usage: openclaw-knobase connect --device-code <device_code> [--name <agent_name>] [--agent <agent_id>]
- * 
- * Implements a streamlined connection flow:
- * 1. Reads ~/.openclaw/openclaw.json and lets user select which OpenClaw agent to connect
- * 2. Takes a device_code (UUID) from the --device-code flag
- * 3. Exchanges it for a token via the device token endpoint
- * 4. Connects the agent to the workspace
- * 5. Saves credentials (including OPENCLAW_AGENT_ID) and starts the webhook server
+ * Knobase Agent Connection — supports two workflows:
+ *
+ * Workflow 1 — CLI First (no --device-code):
+ *   1. POST /api/oauth/device/code to generate a device_code + user_code
+ *   2. Display user_code (XXXX-XXXX) and open browser
+ *   3. Poll /api/oauth/device/token until authorized
+ *   4. POST /api/v1/agents/connect
+ *   5. Save config, sync files, launch webhook
+ *
+ * Workflow 2 — Knobase First (--device-code <uuid>):
+ *   1. Use provided device_code directly
+ *   2. Exchange for token, connect, save config, sync, launch webhook
  */
 
 import fs from 'fs/promises';
@@ -23,6 +25,7 @@ import crypto from 'crypto';
 import chalk from 'chalk';
 import ora from 'ora';
 import fetch from 'node-fetch';
+import open from 'open';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_DIR = path.resolve(__dirname, '..');
@@ -30,8 +33,36 @@ const ENV_FILE = path.join(SKILL_DIR, '.env');
 const OPENCLAW_CONFIG = path.join(os.homedir(), '.openclaw', 'openclaw.json');
 
 const KNOBASE_BASE_URL = 'https://app.knobase.com';
+const DEVICE_CODE_URL = `${KNOBASE_BASE_URL}/api/oauth/device/code`;
 const DEVICE_TOKEN_URL = `${KNOBASE_BASE_URL}/api/oauth/device/token`;
 const AGENT_CONNECT_URL = `${KNOBASE_BASE_URL}/api/v1/agents/connect`;
+
+const POLL_INTERVAL_MS = 5000;
+const POLL_TIMEOUT_MS = 5 * 60 * 1000;
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function promptYesNo(question, defaultYes = false) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      const a = answer.trim().toLowerCase();
+      if (a === '') resolve(defaultYes);
+      else resolve(a === 'y' || a === 'yes');
+    });
+  });
+}
+
+function promptInput(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
 
 function parseArgs(argv) {
   const args = argv.slice(2);
@@ -52,12 +83,122 @@ function parseArgs(argv) {
 }
 
 function generateAgentId() {
-  const uuid = crypto.randomUUID();
-  return `knobase_agent_${uuid}`;
+  return `knobase_agent_${crypto.randomUUID()}`;
+}
+
+// ─── API calls ────────────────────────────────────────────────────────────────
+
+async function requestDeviceCode() {
+  const response = await fetch(DEVICE_CODE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Failed to generate device code (${response.status}): ${body}`);
+  }
+
+  return await response.json();
+}
+
+async function pollForToken(deviceCode) {
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    const response = await fetch(DEVICE_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        device_code: deviceCode,
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      }),
+    });
+
+    if (response.ok) {
+      return await response.json();
+    }
+
+    const body = await response.json().catch(() => ({}));
+    const error = body.error;
+
+    if (error === 'authorization_pending') {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      continue;
+    }
+
+    if (error === 'slow_down') {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS * 2));
+      continue;
+    }
+
+    if (error === 'expired_token') {
+      throw new Error('Device code expired. Please run the command again.');
+    }
+
+    if (error === 'access_denied') {
+      throw new Error('Authorization was denied by the user.');
+    }
+
+    throw new Error(`Token exchange failed (${response.status}): ${body.error_description || body.error || 'unknown error'}`);
+  }
+
+  throw new Error('Timed out waiting for authorization. Please try again.');
+}
+
+async function exchangeCodeForToken(deviceCode) {
+  const response = await fetch(DEVICE_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      device_code: deviceCode,
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Token exchange failed (${response.status}): ${body}`);
+  }
+
+  return await response.json();
+}
+
+async function connectAgent(deviceCode) {
+  const response = await fetch(AGENT_CONNECT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_code: deviceCode }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Failed to connect agent (${response.status}): ${body}`);
+  }
+
+  return await response.json();
+}
+
+// ─── OpenClaw agent selection ─────────────────────────────────────────────────
+
+async function loadOpenClawConfig() {
+  try {
+    const raw = await fs.readFile(OPENCLAW_CONFIG, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function formatModelName(model) {
+  if (!model) return chalk.gray('—');
+  const parts = model.split('/');
+  return chalk.white(parts[parts.length - 1]);
 }
 
 function selectWithArrowKeys(agents, defaultId) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const defaultIndex = defaultId ? agents.findIndex(a => a.id === defaultId) : 0;
     let selected = defaultIndex >= 0 ? defaultIndex : 0;
 
@@ -135,21 +276,6 @@ function selectWithArrowKeys(agents, defaultId) {
   });
 }
 
-async function loadOpenClawConfig() {
-  try {
-    const raw = await fs.readFile(OPENCLAW_CONFIG, 'utf8');
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-function formatModelName(model) {
-  if (!model) return chalk.gray('—');
-  const parts = model.split('/');
-  return chalk.white(parts[parts.length - 1]);
-}
-
 async function selectOpenClawAgent(flagAgentId) {
   const config = await loadOpenClawConfig();
 
@@ -191,6 +317,90 @@ async function selectOpenClawAgent(flagAgentId) {
   return selected;
 }
 
+// ─── File selection ───────────────────────────────────────────────────────────
+
+function selectFilesWithCheckboxes(files) {
+  return new Promise((resolve) => {
+    const checked = files.map(() => true);
+    let cursor = 0;
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    readline.emitKeypressEvents(process.stdin, rl);
+
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
+
+    process.stdout.write('\x1B[?25l');
+
+    const headerLines = 2;
+    const footerLines = 2;
+    let rendered = false;
+
+    function render() {
+      const totalLines = headerLines + files.length + footerLines;
+      if (rendered) {
+        process.stdout.write(`\x1B[${totalLines}A`);
+      }
+      rendered = true;
+
+      process.stdout.write('\x1B[2K' + chalk.white.bold('  Select files to sync:\n'));
+      process.stdout.write('\x1B[2K\n');
+
+      for (let i = 0; i < files.length; i++) {
+        const pointer = i === cursor ? chalk.cyan('▶ ') : '  ';
+        const box = checked[i] ? chalk.green('[x]') : chalk.gray('[ ]');
+        const label = i === cursor
+          ? chalk.white.bold(` ${files[i]}`)
+          : chalk.gray(` ${files[i]}`);
+        process.stdout.write('\x1B[2K' + pointer + box + label + '\n');
+      }
+
+      process.stdout.write('\x1B[2K\n');
+      process.stdout.write('\x1B[2K' + chalk.gray('  All files selected by default. Press Space to uncheck, Enter to confirm') + '\n');
+    }
+
+    render();
+
+    function onKeypress(_ch, key) {
+      if (!key) return;
+
+      if (key.name === 'up') {
+        cursor = (cursor - 1 + files.length) % files.length;
+        render();
+      } else if (key.name === 'down') {
+        cursor = (cursor + 1) % files.length;
+        render();
+      } else if (key.name === 'space') {
+        checked[cursor] = !checked[cursor];
+        render();
+      } else if (key.name === 'return') {
+        cleanup();
+        const selected = files.filter((_, i) => checked[i]);
+        console.log(chalk.green(`\n  ✓ ${selected.length} file(s) selected\n`));
+        resolve(selected);
+      } else if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+        cleanup();
+        console.log(chalk.yellow('\n  Selection cancelled.'));
+        process.exit(0);
+      }
+    }
+
+    function cleanup() {
+      process.stdout.write('\x1B[?25h');
+      process.stdin.removeListener('keypress', onKeypress);
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      rl.close();
+    }
+
+    process.stdin.on('keypress', onKeypress);
+  });
+}
+
+// ─── Config persistence ──────────────────────────────────────────────────────
+
 async function saveConfig(config) {
   const envContent = Object.entries(config)
     .map(([key, value]) => `${key}=${value}`)
@@ -200,38 +410,7 @@ async function saveConfig(config) {
   console.log(chalk.green('\n✓ Configuration saved to .env'));
 }
 
-async function exchangeCodeForToken(deviceCode) {
-  const response = await fetch(DEVICE_TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      device_code: deviceCode,
-      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-    }),
-  });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Token exchange failed (${response.status}): ${body}`);
-  }
-
-  return await response.json();
-}
-
-async function connectAgent(deviceCode) {
-  const response = await fetch(AGENT_CONNECT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ device_code: deviceCode }),
-  });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Failed to connect agent (${response.status}): ${body}`);
-  }
-
-  return await response.json();
-}
+// ─── Webhook launcher ─────────────────────────────────────────────────────────
 
 function launchWebhook() {
   console.log('');
@@ -262,39 +441,38 @@ function launchWebhook() {
   });
 }
 
-async function main() {
-  const flags = parseArgs(process.argv);
+// ─── Shared steps (agent selection, file sync prompt, connect, save, finish) ─
 
-  console.log(chalk.blue.bold('\n⚡ Knobase Quick Connect\n'));
+async function promptFileSync() {
+  console.log(chalk.white.bold('  Sync agent personality files to cloud? ') + chalk.gray('[Y/n]\n'));
+  console.log('  ' + chalk.green('Yes') + ': ☁️  Backup your agent config, ✏️  edit files online, 🔄 sync across devices');
+  console.log('  ' + chalk.gray('No') + ':  Connect without files (you can sync later)\n');
 
-  if (!flags.deviceCode) {
-    console.error(chalk.red('  Error: --device-code flag is required.\n'));
-    console.log(chalk.white('  Usage:'));
-    console.log(chalk.gray('    openclaw-knobase connect --device-code <device_code> [--name <agent_name>] [--agent <agent_id>]\n'));
-    console.log(chalk.gray('  Get your device code from the Knobase app or run:'));
-    console.log(chalk.gray('    openclaw knobase auth\n'));
-    process.exit(1);
+  const wantsSync = await promptYesNo(chalk.white('  Sync files? ') + chalk.gray('[Y/n] '), true);
+
+  if (!wantsSync) {
+    console.log(chalk.gray('\n  Skipping file sync — you can run ') + chalk.cyan('openclaw-knobase sync') + chalk.gray(' later.\n'));
+    return [];
   }
 
-  // Step 1: Select OpenClaw agent
-  const openclawAgent = await selectOpenClawAgent(flags.agent);
+  const allFiles = ['SOUL.md', 'IDENTITY.md', 'USER.md', 'AGENTS.md', 'TOOLS.md', 'MEMORY.md', 'HEARTBEAT.md'];
+  const syncFiles = await selectFilesWithCheckboxes(allFiles);
 
-  const deviceCode = flags.deviceCode;
+  if (syncFiles.length === 0) {
+    console.log(chalk.yellow('\n  No files selected — connecting without file sync.\n'));
+  }
+
+  return syncFiles;
+}
+
+async function connectAndFinish({ deviceCode, flags, openclawAgent, syncFiles }) {
+  if (syncFiles.length > 0) {
+    console.log(chalk.white('  Syncing:     ') + chalk.cyan(syncFiles.join(', ')) + '\n');
+  }
+
   console.log(chalk.white('  Device Code: ') + chalk.yellow.bold(deviceCode) + '\n');
 
-  // Step 2: Exchange device_code for token
-  const tokenSpinner = ora('Exchanging device code for token...').start();
-  let tokenData;
-  try {
-    tokenData = await exchangeCodeForToken(deviceCode);
-    tokenSpinner.succeed('Token received');
-  } catch (err) {
-    tokenSpinner.fail('Token exchange failed');
-    console.error(chalk.red(`\n  ${err.message}\n`));
-    process.exit(1);
-  }
-
-  // Step 3: Connect agent to workspace
+  // Connect agent to workspace
   const connectSpinner = ora('Connecting agent to workspace...').start();
   let agentData;
   try {
@@ -306,9 +484,8 @@ async function main() {
     process.exit(1);
   }
 
-  // Step 4: Save config
+  // Save config
   const { agent_id, api_key, workspace_id } = agentData;
-
   const agentName = flags.name || agentData.name || null;
 
   const config = {
@@ -329,7 +506,7 @@ async function main() {
 
   await saveConfig(config);
 
-  // Step 5: Success message
+  // Success output
   const successLabel = agentName
     ? `\n✅ ${agentName} connected successfully!\n`
     : '\n✅ Connected successfully!\n';
@@ -355,9 +532,92 @@ async function main() {
   console.log(chalk.gray('    @openclaw find action items'));
   console.log(chalk.gray('    @openclaw draft a reply\n'));
 
-  // Step 6: Auto-start webhook server
+  // Auto-start webhook
   console.log(chalk.gray('  Starting webhook server...\n'));
   launchWebhook();
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+async function main() {
+  const flags = parseArgs(process.argv);
+
+  console.log(chalk.blue.bold('\n⚡ Knobase Quick Connect\n'));
+
+  // Select OpenClaw agent (shared by both workflows)
+  const openclawAgent = await selectOpenClawAgent(flags.agent);
+
+  // Prompt for file sync (shared by both workflows)
+  const syncFiles = await promptFileSync();
+
+  if (flags.deviceCode) {
+    // ── Workflow 2: Knobase First (--device-code provided) ──────────────────
+    console.log(chalk.gray('  Using provided device code.\n'));
+
+    const tokenSpinner = ora('Exchanging device code for token...').start();
+    try {
+      await exchangeCodeForToken(flags.deviceCode);
+      tokenSpinner.succeed('Token received');
+    } catch (err) {
+      tokenSpinner.fail('Token exchange failed');
+      console.error(chalk.red(`\n  ${err.message}\n`));
+      process.exit(1);
+    }
+
+    await connectAndFinish({
+      deviceCode: flags.deviceCode,
+      flags,
+      openclawAgent,
+      syncFiles,
+    });
+  } else {
+    // ── Workflow 1: CLI First (generate device code) ────────────────────────
+    const codeSpinner = ora('Requesting device code...').start();
+    let deviceData;
+    try {
+      deviceData = await requestDeviceCode();
+      codeSpinner.succeed('Device code generated');
+    } catch (err) {
+      codeSpinner.fail('Failed to generate device code');
+      console.error(chalk.red(`\n  ${err.message}\n`));
+      process.exit(1);
+    }
+
+    const { device_code, user_code, verification_uri } = deviceData;
+
+    console.log('');
+    console.log(chalk.white.bold('  Your code: ') + chalk.cyan.bold.underline(user_code));
+    console.log('');
+    console.log(chalk.gray('  Enter this code on the Knobase authorization page.'));
+    console.log(chalk.gray('  Opening your browser now...\n'));
+
+    const authUrl = verification_uri || `${KNOBASE_BASE_URL}/oauth/device?code=${user_code}`;
+
+    try {
+      await open(authUrl);
+    } catch {
+      console.log(chalk.yellow('  Could not open browser automatically.'));
+      console.log(chalk.white('  Open this URL manually: ') + chalk.cyan.underline(authUrl) + '\n');
+    }
+
+    const pollSpinner = ora('Waiting for authorization...').start();
+    let tokenData;
+    try {
+      tokenData = await pollForToken(device_code);
+      pollSpinner.succeed('Authorization complete');
+    } catch (err) {
+      pollSpinner.fail('Authorization failed');
+      console.error(chalk.red(`\n  ${err.message}\n`));
+      process.exit(1);
+    }
+
+    await connectAndFinish({
+      deviceCode: device_code,
+      flags,
+      openclawAgent,
+      syncFiles,
+    });
+  }
 }
 
 main().catch((err) => {

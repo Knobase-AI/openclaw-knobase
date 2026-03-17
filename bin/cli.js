@@ -22,6 +22,8 @@ const COMMANDS = {
   'setup': 'setup.js',
   'mention': 'mention.js',
   'workspace': 'workspace.js',
+  'export': 'export.js',
+  'import': 'import.js',
   'docs': null, // routed to docs subcommands
   'agents': null, // routed to agents subcommands
 };
@@ -58,6 +60,8 @@ function showMainHelp() {
   console.log(chalk.gray('  setup      One-command auth + webhook start (--auto, --doc <url>)'));
   console.log(chalk.gray('  docs       Manage workspace documents (list, read, search, create, write, delete, export)'));
   console.log(chalk.gray('  agents     Manage workspace agents (list, info, find, select)'));
+  console.log(chalk.gray('  export     Export agent knowledge base (openclaw, claude, markdown)'));
+  console.log(chalk.gray('  import     Import files into agent knowledge base'));
   console.log(chalk.gray('  workspace  Show workspace information'));
   console.log(chalk.gray('  mention    Create a @mention in a document'));
   console.log(chalk.gray('  --help     Show this help message\n'));
