@@ -7,11 +7,16 @@
  */
 
 import { spawn } from 'child_process';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import chalk from 'chalk';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const SKILL_DIR = path.resolve(__dirname, '..');
+const PID_FILE = path.join(SKILL_DIR, '.daemon.pid');
+const LOG_FILE = path.join(SKILL_DIR, '.daemon.log');
 
 const COMMANDS = {
   'auth': 'auth.js',
@@ -26,6 +31,7 @@ const COMMANDS = {
   'import': 'import.js',
   'docs': null, // routed to docs subcommands
   'agents': null, // routed to agents subcommands
+  'daemon': null, // routed to daemon subcommands
 };
 
 const AGENTS_SUBCOMMANDS = {
@@ -64,9 +70,11 @@ function showMainHelp() {
   console.log(chalk.gray('  import     Import files into agent knowledge base'));
   console.log(chalk.gray('  workspace  Show workspace information'));
   console.log(chalk.gray('  mention    Create a @mention in a document'));
+  console.log(chalk.gray('  daemon     Manage background daemon (start, stop, status, logs, restart)'));
   console.log(chalk.gray('  --help     Show this help message\n'));
   console.log(chalk.gray('Run "openclaw-knobase docs --help" for document subcommands.'));
   console.log(chalk.gray('Run "openclaw-knobase agents --help" for agent subcommands.'));
+  console.log(chalk.gray('Run "openclaw-knobase daemon --help" for daemon subcommands.'));
   process.exit(0);
 }
 
@@ -108,6 +116,166 @@ function showAgentsHelp() {
   console.log(chalk.gray('  openclaw-knobase agents find "code review"'));
   console.log(chalk.gray('  openclaw-knobase agents find python backend'));
   console.log(chalk.gray('  openclaw-knobase agents select'));
+  process.exit(0);
+}
+
+function showDaemonHelp() {
+  console.log(chalk.blue.bold('Knobase Daemon Commands\n'));
+  console.log(chalk.white('Usage: openclaw-knobase daemon <subcommand>\n'));
+  console.log(chalk.white('Subcommands:'));
+  console.log(chalk.gray('  start     Start the background daemon'));
+  console.log(chalk.gray('  stop      Stop the running daemon'));
+  console.log(chalk.gray('  status    Check if the daemon is running'));
+  console.log(chalk.gray('  logs      Show recent daemon logs'));
+  console.log(chalk.gray('  restart   Restart the daemon'));
+  console.log(chalk.gray('  --help    Show this help message\n'));
+  console.log(chalk.gray('Examples:'));
+  console.log(chalk.gray('  openclaw-knobase daemon start'));
+  console.log(chalk.gray('  openclaw-knobase daemon status'));
+  console.log(chalk.gray('  openclaw-knobase daemon logs'));
+  console.log(chalk.gray('  openclaw-knobase daemon stop'));
+  process.exit(0);
+}
+
+function readPid() {
+  try {
+    const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+    return Number.isNaN(pid) ? null : pid;
+  } catch {
+    return null;
+  }
+}
+
+function isProcessRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function daemonStart(extraArgs) {
+  const existingPid = readPid();
+  if (existingPid && isProcessRunning(existingPid)) {
+    console.log(chalk.yellow(`Daemon is already running (PID ${existingPid}).`));
+    console.log(chalk.gray('Use "openclaw-knobase daemon restart" to restart it.'));
+    process.exit(0);
+  }
+
+  if (existingPid) {
+    try { fs.unlinkSync(PID_FILE); } catch {}
+  }
+
+  const logFd = fs.openSync(LOG_FILE, 'a');
+  const scriptPath = path.join(__dirname, 'webhook.js');
+
+  const child = spawn('node', [scriptPath, ...extraArgs], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    cwd: SKILL_DIR,
+    env: { ...process.env, DAEMON_MODE: '1' },
+  });
+
+  fs.writeFileSync(PID_FILE, String(child.pid));
+  child.unref();
+  fs.closeSync(logFd);
+
+  console.log(chalk.green(`Daemon started (PID ${child.pid}).`));
+  console.log(chalk.gray(`Logs: ${LOG_FILE}`));
+  process.exit(0);
+}
+
+function daemonStop() {
+  const pid = readPid();
+
+  if (!pid) {
+    console.log(chalk.yellow('Daemon is not running (no PID file found).'));
+    process.exit(0);
+  }
+
+  if (!isProcessRunning(pid)) {
+    console.log(chalk.yellow(`Daemon process ${pid} is no longer running. Cleaning up PID file.`));
+    try { fs.unlinkSync(PID_FILE); } catch {}
+    process.exit(0);
+  }
+
+  try {
+    process.kill(pid, 'SIGTERM');
+    console.log(chalk.green(`Daemon stopped (PID ${pid}).`));
+  } catch (err) {
+    console.error(chalk.red(`Failed to stop daemon (PID ${pid}): ${err.message}`));
+    process.exit(1);
+  }
+
+  try { fs.unlinkSync(PID_FILE); } catch {}
+  process.exit(0);
+}
+
+function daemonStatus() {
+  const pid = readPid();
+
+  if (!pid) {
+    console.log(chalk.yellow('Daemon is not running (no PID file).'));
+    process.exit(0);
+  }
+
+  if (isProcessRunning(pid)) {
+    console.log(chalk.green(`Daemon is running (PID ${pid}).`));
+  } else {
+    console.log(chalk.yellow(`Daemon is not running (stale PID file for ${pid}). Cleaning up.`));
+    try { fs.unlinkSync(PID_FILE); } catch {}
+  }
+  process.exit(0);
+}
+
+function daemonLogs() {
+  try {
+    const content = fs.readFileSync(LOG_FILE, 'utf8');
+    const lines = content.split('\n');
+    const tail = lines.slice(-100).join('\n');
+    if (!tail.trim()) {
+      console.log(chalk.yellow('No daemon logs found.'));
+    } else {
+      console.log(chalk.blue.bold('Recent daemon logs:\n'));
+      console.log(tail);
+    }
+  } catch {
+    console.log(chalk.yellow('No daemon log file found. Has the daemon been started?'));
+  }
+  process.exit(0);
+}
+
+function daemonRestart(extraArgs) {
+  const pid = readPid();
+
+  if (pid && isProcessRunning(pid)) {
+    try {
+      process.kill(pid, 'SIGTERM');
+      console.log(chalk.gray(`Stopped previous daemon (PID ${pid}).`));
+    } catch (err) {
+      console.error(chalk.red(`Failed to stop existing daemon: ${err.message}`));
+      process.exit(1);
+    }
+    try { fs.unlinkSync(PID_FILE); } catch {}
+  }
+
+  const logFd = fs.openSync(LOG_FILE, 'a');
+  const scriptPath = path.join(__dirname, 'webhook.js');
+
+  const child = spawn('node', [scriptPath, ...extraArgs], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    cwd: SKILL_DIR,
+    env: { ...process.env, DAEMON_MODE: '1' },
+  });
+
+  fs.writeFileSync(PID_FILE, String(child.pid));
+  child.unref();
+  fs.closeSync(logFd);
+
+  console.log(chalk.green(`Daemon restarted (PID ${child.pid}).`));
+  console.log(chalk.gray(`Logs: ${LOG_FILE}`));
   process.exit(0);
 }
 
