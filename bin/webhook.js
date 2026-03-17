@@ -181,6 +181,15 @@ async function startServer(port = 3456) {
     console.log(chalk.gray('Press Ctrl+C to stop\n'));
   });
 
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.log(chalk.green(`✓ Webhook server already running on port ${port}`));
+      process.exit(0);
+    }
+    console.error(chalk.red(`❌ Server error: ${err.message}`));
+    process.exit(1);
+  });
+
   // Graceful shutdown
   process.on('SIGTERM', () => {
     console.log(chalk.yellow('\n[Server] SIGTERM received, shutting down...'));

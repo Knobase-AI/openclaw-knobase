@@ -56,9 +56,82 @@ function generateAgentId() {
   return `knobase_agent_${uuid}`;
 }
 
-function prompt(rl, question) {
-  return new Promise(resolve => {
-    rl.question(question, answer => resolve(answer.trim()));
+function selectWithArrowKeys(agents, defaultId) {
+  return new Promise((resolve, reject) => {
+    const defaultIndex = defaultId ? agents.findIndex(a => a.id === defaultId) : 0;
+    let selected = defaultIndex >= 0 ? defaultIndex : 0;
+
+    const idWidth = 20;
+    const nameWidth = 30;
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    readline.emitKeypressEvents(process.stdin, rl);
+
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
+
+    process.stdout.write('\x1B[?25l');
+
+    let rendered = false;
+
+    function renderList() {
+      if (rendered) {
+        process.stdout.write(`\x1B[${agents.length}A`);
+      }
+      rendered = true;
+
+      for (let i = 0; i < agents.length; i++) {
+        const agent = agents[i];
+        const isDefault = agent.id === defaultId;
+        const pointer = i === selected ? chalk.cyan('▶ ') : '  ';
+        const id = agent.id.slice(0, idWidth - 2).padEnd(idWidth);
+        const name = (agent.name || 'Unnamed').slice(0, nameWidth - 2).padEnd(nameWidth);
+        const model = formatModelName(agent.model);
+        const badge = isDefault ? chalk.yellow(' (default)') : '';
+
+        let line;
+        if (i === selected) {
+          line = pointer + chalk.bgBlue.white.bold(` ${id}${name}`) + ' ' + model + badge;
+        } else {
+          line = pointer + chalk.gray(id) + chalk.gray(name) + ' ' + model + badge;
+        }
+
+        process.stdout.write('\x1B[2K' + line + '\n');
+      }
+    }
+
+    renderList();
+
+    function onKeypress(_ch, key) {
+      if (!key) return;
+
+      if (key.name === 'up') {
+        selected = (selected - 1 + agents.length) % agents.length;
+        renderList();
+      } else if (key.name === 'down') {
+        selected = (selected + 1) % agents.length;
+        renderList();
+      } else if (key.name === 'return') {
+        cleanup();
+        resolve(agents[selected]);
+      } else if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+        cleanup();
+        console.log(chalk.yellow('\n  Selection cancelled.'));
+        process.exit(0);
+      }
+    }
+
+    function cleanup() {
+      process.stdout.write('\x1B[?25h');
+      process.stdin.removeListener('keypress', onKeypress);
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      rl.close();
+    }
+
+    process.stdin.on('keypress', onKeypress);
   });
 }
 
@@ -75,38 +148,6 @@ function formatModelName(model) {
   if (!model) return chalk.gray('—');
   const parts = model.split('/');
   return chalk.white(parts[parts.length - 1]);
-}
-
-function printAgentTable(agents, defaultId) {
-  const idWidth = 20;
-  const nameWidth = 30;
-  const modelWidth = 28;
-
-  const header =
-    chalk.bold('#'.padEnd(5)) +
-    chalk.bold('ID'.padEnd(idWidth)) +
-    chalk.bold('Name'.padEnd(nameWidth)) +
-    chalk.bold('Model');
-
-  const separator = chalk.gray('─'.repeat(5 + idWidth + nameWidth + modelWidth));
-
-  console.log('');
-  console.log(header);
-  console.log(separator);
-
-  for (let i = 0; i < agents.length; i++) {
-    const agent = agents[i];
-    const isDefault = agent.id === defaultId;
-    const num = chalk.bold.white(String(i + 1).padEnd(5));
-    const id = agent.id.slice(0, idWidth - 2).padEnd(idWidth);
-    const name = (agent.name || 'Unnamed').slice(0, nameWidth - 2).padEnd(nameWidth);
-    const model = formatModelName(agent.model);
-    const badge = isDefault ? chalk.yellow(' (default)') : '';
-
-    console.log(num + chalk.cyan(id) + chalk.white(name) + model + badge);
-  }
-
-  console.log(separator);
 }
 
 async function selectOpenClawAgent(flagAgentId) {
@@ -143,43 +184,11 @@ async function selectOpenClawAgent(flagAgentId) {
   }
 
   console.log(chalk.white.bold('  Select which OpenClaw agent to connect to Knobase:\n'));
-  printAgentTable(agents, defaultId);
+  console.log(chalk.gray('  Use ↑/↓ arrow keys to navigate, Enter to select\n'));
 
-  if (defaultId) {
-    console.log(chalk.gray(`\n  Default agent: ${defaultId}`));
-  }
-
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-  try {
-    const defaultHint = defaultId
-      ? ` (Enter for ${defaultId})`
-      : '';
-    const answer = await prompt(rl, chalk.white(`\n  Select agent [1-${agents.length}]${defaultHint}: `));
-
-    if (!answer && defaultId) {
-      const def = agents.find(a => a.id === defaultId);
-      console.log(chalk.green(`  ✓ Using default agent: ${def.name || def.id}\n`));
-      return def;
-    }
-
-    if (!answer) {
-      console.log(chalk.yellow('\n  Selection cancelled.'));
-      process.exit(0);
-    }
-
-    const index = parseInt(answer, 10);
-    if (isNaN(index) || index < 1 || index > agents.length) {
-      console.error(chalk.red(`\n  ✗ Invalid selection. Enter a number between 1 and ${agents.length}.`));
-      process.exit(1);
-    }
-
-    const selected = agents[index - 1];
-    console.log(chalk.green(`  ✓ Selected: ${selected.name || selected.id}\n`));
-    return selected;
-  } finally {
-    rl.close();
-  }
+  const selected = await selectWithArrowKeys(agents, defaultId);
+  console.log(chalk.green(`\n  ✓ Selected: ${selected.name || selected.id}\n`));
+  return selected;
 }
 
 async function saveConfig(config) {
@@ -228,12 +237,28 @@ function launchWebhook() {
   console.log('');
   const webhookPath = path.join(__dirname, 'webhook.js');
   const child = spawn(process.execPath, [webhookPath, 'start'], {
-    stdio: 'inherit',
+    stdio: ['inherit', 'inherit', 'pipe'],
     cwd: SKILL_DIR,
   });
+
+  let stderrBuf = '';
+  child.stderr.on('data', (chunk) => {
+    stderrBuf += chunk.toString();
+  });
+
   child.on('error', (err) => {
     console.error(chalk.red(`\n  Failed to start webhook server: ${err.message}`));
     console.log(chalk.gray('  You can start it manually with: openclaw knobase webhook start\n'));
+  });
+
+  child.on('exit', (code) => {
+    if (code !== 0 && stderrBuf.includes('EADDRINUSE')) {
+      console.log(chalk.green('  ✓ Webhook already running'));
+    } else if (code !== 0) {
+      process.stderr.write(stderrBuf);
+      console.error(chalk.red(`\n  Webhook server exited with code ${code}`));
+      console.log(chalk.gray('  You can start it manually with: openclaw knobase webhook start\n'));
+    }
   });
 }
 
